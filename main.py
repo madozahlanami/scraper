@@ -7,9 +7,6 @@ import time
 import json
 import os
 import re
-import subprocess
-import tempfile
-import uuid
 from datetime import datetime
 from flask import Flask, jsonify
 import threading
@@ -17,43 +14,14 @@ import threading
 # ============= CONFIGURATION =============
 SCRAPE_INTERVAL_MINUTES = 27
 JSON_FILENAME = "results.json"
+SELENIUM_GRID_URL = os.getenv('SELENIUM_GRID_URL', 'http://selenium-hub.railway.internal:4444')
 # ==========================================
 
 app = Flask(__name__)
 
-def install_chrome():
-    """Install Chrome and ChromeDriver"""
-    print("   📦 Installing Chrome...")
-    try:
-        subprocess.run(['apt-get', 'update', '-qq'], check=False, capture_output=True)
-        subprocess.run(['apt-get', 'install', '-y', '-qq', 'wget', 'unzip', 'curl'], check=False, capture_output=True)
-        
-        subprocess.run(['wget', '-q', 'https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb'], check=False, capture_output=True)
-        subprocess.run(['dpkg', '-i', 'google-chrome-stable_current_amd64.deb'], check=False, capture_output=True)
-        subprocess.run(['apt-get', 'install', '-y', '-f', '-qq'], check=False, capture_output=True)
-        
-        # Install matching ChromeDriver for Chrome 146
-        subprocess.run(['wget', '-q', 'https://storage.googleapis.com/chrome-for-testing-public/146.0.7680.165/linux64/chromedriver-linux64.zip'], check=False, capture_output=True)
-        subprocess.run(['unzip', '-q', '-o', 'chromedriver-linux64.zip'], check=False, capture_output=True)
-        subprocess.run(['mv', 'chromedriver-linux64/chromedriver', '/usr/local/bin/'], check=False, capture_output=True)
-        subprocess.run(['chmod', '+x', '/usr/local/bin/chromedriver'], check=False, capture_output=True)
-        
-        # Create cache directory
-        subprocess.run(['mkdir', '-p', '/.cache/selenium'], check=False, capture_output=True)
-        subprocess.run(['chmod', '777', '/.cache/selenium'], check=False, capture_output=True)
-        
-        print("   ✅ Chrome and ChromeDriver installed")
-        return True
-    except Exception as e:
-        print(f"   ⚠️ Chrome install error: {e}")
-        return False
-
 def create_driver():
-    """Create a fresh Chrome driver (for recovery)"""
+    """Create driver using Selenium Grid"""
     try:
-        unique_id = uuid.uuid4().hex[:8]
-        user_data_dir = tempfile.mkdtemp(prefix=f'chrome-{unique_id}-')
-        
         options = Options()
         options.add_argument('--headless')
         options.add_argument('--no-sandbox')
@@ -62,13 +30,16 @@ def create_driver():
         options.add_argument('--disable-gpu')
         options.add_argument('--disable-logging')
         options.add_argument('--log-level=3')
-        options.add_argument(f'--user-data-dir={user_data_dir}')
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
-        driver = webdriver.Chrome(options=options)
+        driver = webdriver.Remote(
+            command_executor=f'{SELENIUM_GRID_URL}/wd/hub',
+            options=options
+        )
+        print("   ✅ Connected to Selenium Grid")
         return driver
     except Exception as e:
-        print(f"   ❌ Failed to create driver: {e}")
+        print(f"   ❌ Failed to connect to grid: {e}")
         return None
 
 def sort_by_round_number(results):
@@ -104,7 +75,7 @@ def save_results(new_results):
             all_results.append(r)
             print(f"      Added new round {num}")
     
-    # Sort by round number (newest first) - YOUR ORIGINAL SORTING
+    # Sort by round number (newest first)
     all_results.sort(key=lambda x: x.get('round_number', 0), reverse=True)
     
     with open(JSON_FILENAME, 'w', encoding='utf-8') as f:
@@ -202,17 +173,16 @@ def scrape_rounds(driver):
 
 def run_scraper_loop():
     print("=" * 70)
-    print("🤖 LOTTERY SCRAPER - AUTO-RECOVERY VERSION")
+    print("🤖 LOTTERY SCRAPER - SELENIUM GRID VERSION")
     print("=" * 70)
+    print("   ✓ Using Railway Selenium Grid")
+    print("   ✓ No local Chrome installation needed")
     print("   ✓ Auto-recovery on failures")
-    print("   ✓ Keeps your original sorting")
     print("=" * 70)
     print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"⏱️  Scrape interval: {SCRAPE_INTERVAL_MINUTES} minutes")
+    print(f"🔗 Grid URL: {SELENIUM_GRID_URL}")
     print("=" * 70)
-    
-    # Install Chrome on first run
-    install_chrome()
     
     existing = load_existing_data()
     print(f"\n📊 Starting with {len(existing)} rounds")
@@ -227,10 +197,10 @@ def run_scraper_loop():
         
         # Create driver if needed
         if driver is None:
-            print("   Creating Chrome driver...")
+            print("   Connecting to Selenium Grid...")
             driver = create_driver()
             if driver is None:
-                print("   ❌ Failed to create driver")
+                print("   ❌ Failed to connect to grid")
                 consecutive_failures += 1
                 time.sleep(60)
                 continue
@@ -289,7 +259,6 @@ def get_data():
         with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
             data = json.load(f)
             results = data.get('results', [])
-            # YOUR ORIGINAL SORTING
             results.sort(key=lambda x: x.get('round_number', 0), reverse=True)
             data['results'] = results
             return jsonify(data)
