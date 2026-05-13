@@ -15,9 +15,98 @@ import threading
 SCRAPE_INTERVAL_MINUTES = 27
 JSON_FILENAME = "results.json"
 SELENIUM_GRID_URL = os.getenv('SELENIUM_GRID_URL', 'http://selenium-hub.railway.internal:4444')
+TIME_THRESHOLD_SECONDS = 240  # 4 minutes
 # ==========================================
 
 app = Flask(__name__)
+
+def parse_timestamp(ts_str):
+    """Convert timestamp string to datetime object for sorting"""
+    try:
+        return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+    except:
+        return datetime.min
+
+def sort_by_timestamp_then_round(results):
+    """
+    CRITICAL SORTING RULE:
+    1. First sort by timestamp (oldest first)
+    2. If timestamps are within 4 minutes, then sort by round number
+    """
+    if not results:
+        return results
+    
+    # Add parsed timestamp to each result
+    for r in results:
+        r['_parsed_timestamp'] = parse_timestamp(r.get('timestamp', ''))
+    
+    # Sort by timestamp first
+    results.sort(key=lambda x: x['_parsed_timestamp'])
+    
+    # Now handle clusters within 4 minutes
+    i = 0
+    n = len(results)
+    while i < n:
+        j = i
+        base_ts = results[i]['_parsed_timestamp']
+        # Find cluster where timestamps are within THRESHOLD
+        while j < n:
+            diff = (results[j]['_parsed_timestamp'] - base_ts).total_seconds()
+            if diff < TIME_THRESHOLD_SECONDS:
+                j += 1
+            else:
+                break
+        # Sort this cluster by round number (ascending)
+        if j - i > 1:
+            results[i:j] = sorted(results[i:j], key=lambda x: x.get('round_number', 0))
+        i = j
+    
+    # Remove temporary field
+    for r in results:
+        del r['_parsed_timestamp']
+    
+    return results
+
+def load_existing_data():
+    if not os.path.exists(JSON_FILENAME):
+        return []
+    try:
+        with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data.get('results', [])
+    except:
+        return []
+
+def save_results(new_results):
+    existing = load_existing_data()
+    
+    # Merge existing and new
+    seen = set()
+    all_results = []
+    for r in existing:
+        num = r.get('round_number')
+        if num not in seen:
+            seen.add(num)
+            all_results.append(r)
+    for r in new_results:
+        num = r.get('round_number')
+        if num not in seen:
+            seen.add(num)
+            all_results.append(r)
+            print(f"      Added new round {num}")
+    
+    # CRITICAL: Sort by timestamp first, then round number within 4 minutes
+    all_results = sort_by_timestamp_then_round(all_results)
+    
+    # Save to file
+    with open(JSON_FILENAME, 'w', encoding='utf-8') as f:
+        json.dump({
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_rows": len(all_results),
+            "results": all_results
+        }, f, indent=2)
+    
+    return len(all_results)
 
 def create_driver():
     """Create driver using Selenium Grid"""
@@ -42,51 +131,6 @@ def create_driver():
         print(f"   ❌ Failed to connect to grid: {e}")
         return None
 
-def sort_by_round_number(results):
-    if not results:
-        return results
-    return sorted(results, key=lambda x: x.get('round_number', 0), reverse=True)
-
-def load_existing_data():
-    if not os.path.exists(JSON_FILENAME):
-        return []
-    try:
-        with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return data.get('results', [])
-    except:
-        return []
-
-def save_results(new_results):
-    existing = load_existing_data()
-    
-    # Merge
-    seen = set()
-    all_results = []
-    for r in existing:
-        num = r.get('round_number')
-        if num not in seen:
-            seen.add(num)
-            all_results.append(r)
-    for r in new_results:
-        num = r.get('round_number')
-        if num not in seen:
-            seen.add(num)
-            all_results.append(r)
-            print(f"      Added new round {num}")
-    
-    # Sort by round number (newest first)
-    all_results.sort(key=lambda x: x.get('round_number', 0), reverse=True)
-    
-    with open(JSON_FILENAME, 'w', encoding='utf-8') as f:
-        json.dump({
-            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "total_rows": len(all_results),
-            "results": all_results
-        }, f, indent=2)
-    
-    return len(all_results)
-
 def extract_numbers_from_balls(balls_div):
     numbers = []
     buttons = balls_div.find_elements(By.TAG_NAME, "button")
@@ -97,7 +141,7 @@ def extract_numbers_from_balls(balls_div):
     return numbers
 
 def scrape_rounds(driver):
-    """Scrape rounds"""
+    """Scrape rounds from website"""
     try:
         driver.get('https://www.simacombet.com/luckysix')
         time.sleep(3)
@@ -176,8 +220,7 @@ def run_scraper_loop():
     print("🤖 LOTTERY SCRAPER - SELENIUM GRID VERSION")
     print("=" * 70)
     print("   ✓ Using Railway Selenium Grid")
-    print("   ✓ No local Chrome installation needed")
-    print("   ✓ Auto-recovery on failures")
+    print("   ✓ Sorting: TIMESTAMP first, then ROUND NUMBER within 4 minutes")
     print("=" * 70)
     print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"⏱️  Scrape interval: {SCRAPE_INTERVAL_MINUTES} minutes")
@@ -195,7 +238,6 @@ def run_scraper_loop():
         iteration += 1
         print(f"\n🔄 ITERATION #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Create driver if needed
         if driver is None:
             print("   Connecting to Selenium Grid...")
             driver = create_driver()
@@ -220,7 +262,6 @@ def run_scraper_loop():
                 print(f"✅ Scrape successful! Total rounds: {len(load_existing_data())}")
                 
             else:
-                # Scrape failed - recreate driver
                 consecutive_failures += 1
                 print(f"⚠️ Scrape failed ({consecutive_failures})")
                 
@@ -259,7 +300,8 @@ def get_data():
         with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
             data = json.load(f)
             results = data.get('results', [])
-            results.sort(key=lambda x: x.get('round_number', 0), reverse=True)
+            # Apply the same sorting rule before sending
+            results = sort_by_timestamp_then_round(results)
             data['results'] = results
             return jsonify(data)
     return {"error": "No data"}
