@@ -1,2 +1,2 @@
-playwright==1.40.0
+selenium==4.15.0
 flask==3.0.0
