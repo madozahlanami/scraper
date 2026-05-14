@@ -11,110 +11,161 @@ from datetime import datetime
 from flask import Flask, jsonify
 import threading
 
-app = Flask(__name__)
-JSON_FILENAME = "results.json"
+# ============= CONFIGURATION =============
 SCRAPE_INTERVAL_MINUTES = 27
+JSON_FILENAME = "results.json"
+SELENIUM_GRID_URL = os.getenv('SELENIUM_GRID_URL', 'http://selenium-hub.railway.internal:4444')
+TIME_THRESHOLD_SECONDS = 240  # 4 minutes
+# ==========================================
+
+app = Flask(__name__)
+
+def parse_timestamp(ts_str):
+    """Convert timestamp string to datetime object for sorting"""
+    try:
+        return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+    except:
+        return datetime.min
+
+def sort_by_timestamp_then_round(results):
+    """
+    CRITICAL SORTING RULE:
+    1. First sort by timestamp (oldest first)
+    2. If timestamps are within 4 minutes, then sort by round number
+    """
+    if not results:
+        return results
+    
+    # Add parsed timestamp to each result
+    for r in results:
+        r['_parsed_timestamp'] = parse_timestamp(r.get('timestamp', ''))
+    
+    # Sort by timestamp first
+    results.sort(key=lambda x: x['_parsed_timestamp'])
+    
+    # Now handle clusters within 4 minutes
+    i = 0
+    n = len(results)
+    while i < n:
+        j = i
+        base_ts = results[i]['_parsed_timestamp']
+        # Find cluster where timestamps are within THRESHOLD
+        while j < n:
+            diff = (results[j]['_parsed_timestamp'] - base_ts).total_seconds()
+            if diff < TIME_THRESHOLD_SECONDS:
+                j += 1
+            else:
+                break
+        # Sort this cluster by round number (ascending)
+        if j - i > 1:
+            results[i:j] = sorted(results[i:j], key=lambda x: x.get('round_number', 0))
+        i = j
+    
+    # Remove temporary field
+    for r in results:
+        del r['_parsed_timestamp']
+    
+    return results
 
 def load_existing_data():
     if not os.path.exists(JSON_FILENAME):
         return []
     try:
-        with open(JSON_FILENAME, 'r') as f:
+        with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
             data = json.load(f)
             return data.get('results', [])
     except:
         return []
 
-def save_results(new_rounds):
+def save_results(new_results):
     existing = load_existing_data()
-    seen = {r.get('round_number') for r in existing}
-    all_results = existing.copy()
     
-    for r in new_rounds:
-        if r.get('round_number') not in seen:
-            seen.add(r.get('round_number'))
+    # Merge existing and new
+    seen = set()
+    all_results = []
+    for r in existing:
+        num = r.get('round_number')
+        if num not in seen:
+            seen.add(num)
             all_results.append(r)
-            print(f"   ✅ Added round {r.get('round_number')}")
+    for r in new_results:
+        num = r.get('round_number')
+        if num not in seen:
+            seen.add(num)
+            all_results.append(r)
+            print(f"      Added new round {num}")
     
-    with open(JSON_FILENAME, 'w') as f:
-        json.dump({"results": all_results, "total": len(all_results)}, f, indent=2)
+    # CRITICAL: Sort by timestamp first, then round number within 4 minutes
+    all_results = sort_by_timestamp_then_round(all_results)
+    
+    # Save to file
+    with open(JSON_FILENAME, 'w', encoding='utf-8') as f:
+        json.dump({
+            "generated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "total_rows": len(all_results),
+            "results": all_results
+        }, f, indent=2)
     
     return len(all_results)
 
-def scrape_rounds():
-    """Direct Chrome connection - NO GRID NEEDED"""
-    driver = None
+def create_driver():
+    """Create driver using Selenium Grid"""
     try:
         options = Options()
         options.add_argument('--headless')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--window-size=1920,1080')
         options.add_argument('--disable-gpu')
-        options.add_argument('--disable-blink-features=AutomationControlled')
-        options.add_argument('--disable-extensions')
-        options.add_argument('--disable-plugins')
-        options.add_argument('--disable-images')
-        options.add_argument('--disable-default-apps')
-        options.add_argument('--no-first-run')
-        options.add_argument('--no-default-browser-check')
-        options.add_argument('--disable-sync')
-        options.add_argument('--disable-translate')
-        options.add_argument('--disable-background-networking')
-        options.add_argument('--disable-client-side-phishing-detection')
-        options.add_argument('--disable-component-extensions-with-background-pages')
-        options.add_argument('--disable-hang-monitor')
-        options.add_argument('--disable-popup-blocking')
-        options.add_argument('--disable-prompt-on-repost')
-        options.add_argument('--disable-background-timer-throttling')
-        options.add_argument('--disable-renderer-backgrounding')
-        options.add_argument('--disable-device-discovery-notifications')
-        options.add_argument('--disable-breakpad')
-        options.add_argument('--disable-component-update')
-        options.add_argument('--disable-extensions-file-access-check')
-        options.add_argument('--disable-preconnect')
-        options.add_argument('--disable-sync-preferences')
-        options.add_argument('--metrics-recording-only')
-        options.add_argument('--mute-audio')
-        options.add_argument('--no-service-autorun')
-        options.add_argument('--password-store=basic')
-        options.add_argument('--use-mock-keychain')
-
-        # Connect directly to Chrome (not grid) with a timeout
-        print("   🔄 Starting Chrome...")
-        try:
-            driver = webdriver.Chrome(options=options)
-            driver.set_page_load_timeout(60)
-            driver.set_script_timeout(30)
-        except Exception as chrome_err:
-            print(f"   ❌ Chrome failed to start: {chrome_err}")
-            return None
-        print("   ✅ Chrome started")
+        options.add_argument('--disable-logging')
+        options.add_argument('--log-level=3')
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
         
+        driver = webdriver.Remote(
+            command_executor=f'{SELENIUM_GRID_URL}/wd/hub',
+            options=options
+        )
+        print("   ✅ Connected to Selenium Grid")
+        return driver
+    except Exception as e:
+        print(f"   ❌ Failed to connect to grid: {e}")
+        return None
+
+def extract_numbers_from_balls(balls_div):
+    numbers = []
+    buttons = balls_div.find_elements(By.TAG_NAME, "button")
+    for button in buttons:
+        text = button.text.strip()
+        if text and text.isdigit():
+            numbers.append(text)
+    return numbers
+
+def scrape_rounds(driver):
+    """Scrape rounds from website"""
+    try:
         driver.get('https://www.simacombet.com/luckysix')
         time.sleep(3)
         
-        # Switch to iframe
         iframe = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "PluginLuckySix"))
         )
         driver.switch_to.frame(iframe)
         
-        # Click results button
         button = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Results')]"))
         )
         button.click()
         time.sleep(2)
         
-        # Get rounds
         round_rows = driver.find_elements(By.CSS_SELECTOR, "div.round-row")
         print(f"   Found {len(round_rows)} rounds")
         
         existing = load_existing_data()
         existing_nums = {r.get('round_number') for r in existing}
+        
         new_rounds = []
         
-        for row in round_rows[:5]:
+        for row in round_rows:
             try:
                 title = row.find_element(By.CSS_SELECTOR, "div.accordion-title")
                 title_text = title.text.strip()
@@ -126,77 +177,139 @@ def scrape_rounds():
                 if round_num in existing_nums:
                     continue
                 
+                driver.execute_script("arguments[0].scrollIntoView();", row)
+                time.sleep(0.5)
                 row.click()
                 time.sleep(2)
                 
                 draw_seqs = driver.find_elements(By.CSS_SELECTOR, "div.draw-sequence")
-                numbers = []
+                first_numbers = []
                 
                 for seq in draw_seqs:
                     seq_title = seq.find_element(By.CSS_SELECTOR, "div.title").text.lower()
                     if "drawn" in seq_title:
-                        balls = seq.find_elements(By.CSS_SELECTOR, "div.balls button")
-                        for ball in balls:
-                            text = ball.text.strip()
-                            if text and text.isdigit():
-                                numbers.append(text)
+                        balls = seq.find_elements(By.CSS_SELECTOR, "div.balls")
+                        for b in balls:
+                            first_numbers.extend(extract_numbers_from_balls(b))
                 
-                if numbers:
-                    new_rounds.append({
-                        'round_number': round_num,
-                        'round_title': title_text,
-                        'first_draw_numbers': [int(n) for n in numbers],
-                        'second_draw_numbers': [],
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    print(f"   ✅ Round {round_num}: {numbers}")
+                result = {
+                    'round_number': round_num,
+                    'round_title': title_text,
+                    'first_draw_numbers': [int(n) for n in first_numbers],
+                    'second_draw_numbers': [],
+                    'timestamp': datetime.now().isoformat()
+                }
+                new_rounds.append(result)
+                print(f"   ✅ Round {round_num} collected")
                 
                 row.click()
                 time.sleep(1)
                 
             except Exception as e:
-                print(f"   ⚠️ Error: {e}")
+                print(f"   ⚠️ Error on round: {e}")
                 continue
         
         return new_rounds
         
     except Exception as e:
-        print(f"   ❌ Error: {e}")
+        print(f"   ❌ Scrape error: {e}")
         return None
-    finally:
-        if driver:
-            driver.quit()
 
-def run_scraper():
-    print("=" * 60)
-    print("🤖 LOTTERY SCRAPER - DIRECT CHROME")
-    print("=" * 60)
+def run_scraper_loop():
+    print("=" * 70)
+    print("🤖 LOTTERY SCRAPER - SELENIUM GRID VERSION")
+    print("=" * 70)
+    print("   ✓ Using Railway Selenium Grid")
+    print("   ✓ Sorting: TIMESTAMP first, then ROUND NUMBER within 4 minutes")
+    print("=" * 70)
+    print(f"📅 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"⏱️  Scrape interval: {SCRAPE_INTERVAL_MINUTES} minutes")
+    print(f"🔗 Grid URL: {SELENIUM_GRID_URL}")
+    print("=" * 70)
+    
+    existing = load_existing_data()
+    print(f"\n📊 Starting with {len(existing)} rounds")
+    
+    iteration = 0
+    consecutive_failures = 0
+    driver = None
     
     while True:
-        print(f"\n🔄 Scraping at {datetime.now()}")
-        new_rounds = scrape_rounds()
+        iteration += 1
+        print(f"\n🔄 ITERATION #{iteration} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        if new_rounds:
-            total = save_results(new_rounds)
-            print(f"💾 Saved {len(new_rounds)} rounds. Total: {total}")
-        else:
-            print("No new rounds found")
+        if driver is None:
+            print("   Connecting to Selenium Grid...")
+            driver = create_driver()
+            if driver is None:
+                print("   ❌ Failed to connect to grid")
+                consecutive_failures += 1
+                time.sleep(60)
+                continue
         
-        print(f"💤 Sleeping 27 minutes...")
-        time.sleep(27 * 60)
+        try:
+            new_rounds = scrape_rounds(driver)
+            
+            if new_rounds is not None:
+                if new_rounds:
+                    total = save_results(new_rounds)
+                    print(f"   💾 Saved {len(new_rounds)} new rounds. Total: {total}")
+                    consecutive_failures = 0
+                else:
+                    print("   No new rounds found")
+                    consecutive_failures = 0
+                
+                print(f"✅ Scrape successful! Total rounds: {len(load_existing_data())}")
+                
+            else:
+                consecutive_failures += 1
+                print(f"⚠️ Scrape failed ({consecutive_failures})")
+                
+                if driver:
+                    try:
+                        driver.quit()
+                    except:
+                        pass
+                    driver = None
+                
+                if consecutive_failures >= 3:
+                    print("   Waiting 2 minutes before retry...")
+                    time.sleep(120)
+                    consecutive_failures = 0
+                
+        except Exception as e:
+            print(f"❌ Error: {e}")
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+                driver = None
+            time.sleep(30)
+        
+        print(f"\n💤 Sleeping for {SCRAPE_INTERVAL_MINUTES} minutes...")
+        time.sleep(SCRAPE_INTERVAL_MINUTES * 60)
 
 @app.route('/')
 def home():
-    return "<h1>Lottery Scraper</h1><a href='/data'>View Data</a>"
+    return "<h1>Lottery Scraper</h1><p><a href='/data'>View data</a></p>"
 
 @app.route('/data')
 def get_data():
     if os.path.exists(JSON_FILENAME):
-        with open(JSON_FILENAME, 'r') as f:
-            return jsonify(json.load(f))
+        with open(JSON_FILENAME, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            results = data.get('results', [])
+            # Apply the same sorting rule before sending
+            results = sort_by_timestamp_then_round(results)
+            data['results'] = results
+            return jsonify(data)
     return {"error": "No data"}
 
 if __name__ == "__main__":
-    thread = threading.Thread(target=run_scraper, daemon=True)
+    thread = threading.Thread(target=run_scraper_loop)
+    thread.daemon = True
     thread.start()
+    
+    print("\nStarting web server...")
     app.run(host='0.0.0.0', port=10000)
