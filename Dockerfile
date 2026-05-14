@@ -13,6 +13,35 @@ RUN apt-get update && apt-get install -y \
     && apt-get update && apt-get install -y \
     google-chrome-stable \
     --no-install-recommends \
+    && apt-get install -y \
+    libxss1 \
+    libappindicator3-1 \
+    libindicator7 \
+    libgconf-2-4 \
+    libxkbcommon0 \
+    libatk-bridge2.0-0 \
+    libatspi2.0-0 \
+    libgtk-3-0 \
+    libgdk-pixbuf-2.0-0 \
+    libpango-1.0-0 \
+    libpangoft2-1.0-0 \
+    libcairo2 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxrandr2 \
+    libxinerama1 \
+    libxcursor1 \
+    libxi6 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxkbcommon-x11-0 \
+    fonts-liberation \
+    xdg-utils \
+    wget \
+    ca-certificates \
+    --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
