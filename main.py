@@ -12,7 +12,7 @@ from flask import Flask, jsonify
 import threading
 
 # ============= CONFIGURATION =============
-SCRAPE_INTERVAL_MINUTES = 25
+SCRAPE_INTERVAL_MINUTES = 20
 JSON_FILENAME = "results.json"
 SELENIUM_GRID_URL = os.getenv('SELENIUM_GRID_URL', 'http://selenium-hub.railway.internal:4444')
 TIME_THRESHOLD_SECONDS = 240  # 4 minutes
